@@ -1,0 +1,5 @@
+.env
+clips/
+__pycache__/
+*.jpg
+*.mp4

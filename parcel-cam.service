@@ -1,0 +1,16 @@
+[Unit]
+Description=Parcel camera watcher (motion -> Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/blockstore/parcel-cam
+EnvironmentFile=/mnt/blockstore/parcel-cam/.env
+ExecStart=/usr/bin/python3 -u /mnt/blockstore/parcel-cam/cam.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
