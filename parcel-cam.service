@@ -2,6 +2,8 @@
 Description=Parcel camera watcher (motion -> Telegram)
 After=network-online.target
 Wants=network-online.target
+# Blockstore mounts after systemd starts; wait for it or the unit fails to load.
+RequiresMountsFor=/mnt/blockstore
 
 [Service]
 Type=simple
