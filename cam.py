@@ -23,7 +23,16 @@ COOLDOWN = int(os.environ.get("COOLDOWN", "90"))
 KEEP_DAYS = int(os.environ.get("KEEP_DAYS", "14"))
 PIXEL_DELTA = int(os.environ.get("PIXEL_DELTA", "25"))       # grey levels that count as "changed"
 MOTION_FRAC = float(os.environ.get("MOTION_FRAC", "0.01"))  # 1% of the frame moved
-MOTION_FRAMES = int(os.environ.get("MOTION_FRAMES", "2"))   # consecutive hits to fire
+MOTION_FRAMES = int(os.environ.get("MOTION_FRAMES", "2"))   # hits needed inside MOTION_WINDOW
+# How many hits must land inside MOTION_WINDOW seconds. A window rather than a strict
+# consecutive run because real motion at the threshold flickers across it, while a dropped
+# link gives one isolated spike and recovers.
+MOTION_WINDOW = float(os.environ.get("MOTION_WINDOW", "2.0"))
+# Contrast a frame needs before it counts as a picture. A flat frame means the link dropped or
+# the decoder had no reference frame; compared against the last real picture it lights up the
+# whole screen and reads as 100% motion. Measured on the parcel cam at night: a real scene
+# spreads well over 100 grey levels, a dead frame is flat.
+DEAD_SPREAD = int(os.environ.get("DEAD_SPREAD", "16"))
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT", "")
 CLIPS = Path(os.environ.get("CLIPS_DIR", "/dev/shm/parcel-cam"))   # tmpfs = RAM, wiped on reboot
@@ -54,14 +63,16 @@ def record(path, seconds=None):
     return p.returncode == 0 and path.exists() and path.stat().st_size > 20000
 
 
-def tg(method, path, caption):
+def tg(method, path, caption, thumb=None):
     if not TG_TOKEN:
         print("[tg] no TG_TOKEN, kept locally:", path, flush=True)
         return False
     field = "video" if path.suffix == ".mp4" else "photo"
-    p = subprocess.run(["curl", "-sS", "--max-time", "180", "-F", f"chat_id={TG_CHAT}",
-                        "-F", f"caption={caption}", "-F", f"{field}=@{path}",
-                        f"https://api.telegram.org/bot{TG_TOKEN}/{method}"],
+    cmd = ["curl", "-sS", "--max-time", "180", "-F", f"chat_id={TG_CHAT}",
+           "-F", f"caption={caption}", "-F", f"{field}=@{path}"]
+    if thumb:
+        cmd += ["-F", f"thumbnail=@{thumb}"]
+    p = subprocess.run(cmd + [f"https://api.telegram.org/bot{TG_TOKEN}/{method}"],
                        capture_output=True, text=True, timeout=190)
     ok = '"ok":true' in p.stdout
     print(f"[tg] {field} {'ok' if ok else 'FAIL ' + (p.stdout or p.stderr)[:200]}", flush=True)
@@ -79,7 +90,23 @@ def motion_frac(cur, prev):
     return sum(1 for a, b in zip(cur, prev) if abs(a - b) > PIXEL_DELTA) / len(cur)
 
 
-def frames():
+def dead(frame):
+    """True when the frame carries no picture at all — a dropped link, not a dark yard.
+
+    When the RTSP link drops or the decoder has no reference frame, ffmpeg emits a flat
+    picture. Compared against the last real frame it lights up every pixel and reads as 100%
+    of the screen moving. Deliberately not a brightness test: a night frame still has IR-lit
+    contrast and passes.
+
+    ponytail: a genuine scene with no contrast anywhere (a lens covered by a hand, a totally
+    blank wall filling the frame) also reads as dead and is skipped. Distinguishing "camera
+    blinded" from "link dropped" needs a per-pixel temporal check, not a per-frame one — add
+    it if you ever need an alert for tampering.
+    """
+    return max(frame) - min(frame) < DEAD_SPREAD
+
+
+def stream_frames():
     """Yield 320x240 grey frames at 2 fps from the sub stream."""
     n = W * H
     proc = subprocess.Popen([FFMPEG, "-loglevel", "error", "-rtsp_transport", "tcp",
@@ -97,34 +124,67 @@ def frames():
 
 
 def handle(seconds=None):
-    """Grab photo + clip into tmpfs, upload both, delete each file the moment its
-    upload succeeds. A failed upload keeps the file on disk so nothing is lost."""
+    """Record clip into tmpfs, upload it with a caption (and a frame grabbed as
+    thumbnail), delete the file the moment the upload succeeds. A failed upload
+    keeps the file on disk so nothing is lost."""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     jpg, mp4 = CLIPS / f"{stamp}.jpg", CLIPS / f"{stamp}.mp4"
     when = datetime.now()
-    if grab_photo(jpg) and tg("sendPhoto", jpg, f"📦 Gói hàng — chuyển động {when:%H:%M:%S %d/%m/%Y}"):
-        jpg.unlink(missing_ok=True)
-    if record(mp4, seconds) and tg("sendVideo", mp4, f"🎬 {seconds or CLIP_SECONDS}s @ {when:%H:%M:%S %d/%m/%Y}"):
-        mp4.unlink(missing_ok=True)
+    if record(mp4, seconds):
+        grab_photo(jpg)                     # thumbnail only, never sent on its own
+        caption = f"📦 Gói hàng — chuyển động {when:%H:%M:%S %d/%m/%Y}"
+        if tg("sendVideo", mp4, caption, thumb=jpg if jpg.exists() else None):
+            mp4.unlink(missing_ok=True)
+            jpg.unlink(missing_ok=True)
     prune()
+
+
+def fires(hits, now, frames=None, window=None):
+    """Prune `hits` to the window and report whether enough landed inside it.
+
+    Extracted so the one non-trivial branch is testable without a camera: `hits` is a list of
+    timestamps, mutated in place to stay bounded. Dense motion, not one tall spike — a single
+    frame at 100% (a link recovering) can never satisfy MOTION_FRAMES >= 2.
+    """
+    frames = MOTION_FRAMES if frames is None else frames
+    window = MOTION_WINDOW if window is None else window
+    hits[:] = [t for t in hits if now - t <= window]
+    return len(hits) >= frames
 
 
 def watch():
     CLIPS.mkdir(parents=True, exist_ok=True)
-    print(f"[cam] watching {CAM_IP} frac>{MOTION_FRAC} cooldown={COOLDOWN}s", flush=True)
-    prev, hits, last = None, 0, 0.0
+    print(f"[cam] watching {CAM_IP} frac>{MOTION_FRAC} "
+          f"x{MOTION_FRAMES}/{MOTION_WINDOW:.0f}s cooldown={COOLDOWN}s", flush=True)
+    prev, last = None, 0.0
+    hits = []                # timestamps of recent frames above MOTION_FRAC
+    dead_run = 0
     while True:
         try:
-            for cur in frames():
+            for cur in stream_frames():
+                # A lost picture is not motion: skip the frame AND drop the reference, so the
+                # next real frame is not compared against the one from before the outage.
+                if dead(cur):
+                    prev = None
+                    dead_run += 1
+                    hits.clear()
+                    continue
+                if dead_run:
+                    print(f"[signal] {dead_run} flat frame(s) ignored", flush=True)
+                    dead_run = 0
                 if prev is None:
                     prev = cur
                     continue
-                frac, prev = motion_frac(cur, prev), cur
-                hits = hits + 1 if frac > MOTION_FRAC else 0
-                if hits < MOTION_FRAMES or time.time() - last < COOLDOWN:
+                frac = motion_frac(cur, prev)
+                prev = cur
+                now = time.time()
+                if frac > MOTION_FRAC:
+                    hits.append(now)
+                if not fires(hits, now) or now - last < COOLDOWN:
                     continue
-                last, hits = time.time(), 0
-                print(f"[motion] frac={frac:.3f}", flush=True)
+                last, hits = now, []
+                print(f"[motion] frac={frac:.3f} hits={MOTION_FRAMES}/{MOTION_WINDOW:.0f}s",
+                      flush=True)
                 handle()
         except Exception as e:
             print("[loop]", type(e).__name__, str(e)[:160], flush=True)
@@ -133,7 +193,7 @@ def watch():
 
 def calib(seconds):
     prev, scores, start = None, [], time.time()
-    for cur in frames():
+    for cur in stream_frames():
         if prev is not None:
             scores.append(motion_frac(cur, prev))
         prev = cur
