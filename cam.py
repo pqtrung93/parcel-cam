@@ -160,6 +160,7 @@ def watch():
     hits = []                # timestamps of recent frames above MOTION_FRAC
     dead_run = 0
     while True:
+        warm = 3             # the first frames after a (re)connect are an auto-exposure settle
         try:
             for cur in stream_frames():
                 # A lost picture is not motion: skip the frame AND drop the reference, so the
@@ -173,6 +174,12 @@ def watch():
                     print(f"[signal] {dead_run} flat frame(s) ignored", flush=True)
                     dead_run = 0
                 if prev is None:
+                    prev = cur
+                    continue
+                # ponytail: a flat skip or a reconnect re-enters here; the first frames after
+                # one are an exposure/reference settle and measure 4-6% on a still scene.
+                if warm:
+                    warm -= 1
                     prev = cur
                     continue
                 frac = motion_frac(cur, prev)
