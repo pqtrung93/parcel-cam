@@ -63,3 +63,25 @@ print(f"dead FRAME OK: black=True grey=True flatwall=True night-contrast=False "
       f"(DEAD_SPREAD={cam.DEAD_SPREAD})")
 print(f"fires OK: 1 spike=no, 2 spikes 4s apart=no, 2 close=yes "
       f"({cam.MOTION_FRAMES}/{cam.MOTION_WINDOW:.0f}s)")
+
+
+# --- a stalled stream must not freeze the watcher --------------------------------------
+# The real failure: ffmpeg stopped producing frames while its RTSP socket stayed open.
+# read(n) blocked forever, no exception, no log — the service sat frozen for 7 days.
+import subprocess, sys
+cam.FRAME_TIMEOUT = 1.0                     # keep the check under a second
+# A stalled writer: a process that inherits the pipe but never writes and never closes it.
+proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                        stdout=subprocess.PIPE)
+cam.subprocess.Popen = lambda *a, **k: proc   # make stream_frames use our stalled process
+gen = cam.stream_frames()
+try:
+    next(gen)
+    raise AssertionError("a stalled stream must yield nothing")
+except StopIteration:
+    pass                                    # correct: it returned so watch() can reconnect
+finally:
+    proc.kill()
+    cam.subprocess.Popen = subprocess.Popen   # restore
+print("stall OK: stream_frames returns after %.1fs with no frame (watch() reconnects)"
+      % cam.FRAME_TIMEOUT)

@@ -11,7 +11,7 @@ and PullPoint answers "Subscribe Creation Failed". So motion comes from the vide
 itself: ffmpeg decodes the 640x480 sub stream to 320x240 grey at 2 fps and we count
 pixels that moved. Measured noise on a static scene: <0.1% of pixels.
 """
-import os, subprocess, sys, time
+import os, select, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +33,9 @@ MOTION_WINDOW = float(os.environ.get("MOTION_WINDOW", "2.0"))
 # whole screen and reads as 100% motion. Measured on the parcel cam at night: a real scene
 # spreads well over 100 grey levels, a dead frame is flat.
 DEAD_SPREAD = int(os.environ.get("DEAD_SPREAD", "16"))
+# Longest the stream may go silent before it is treated as a dead link. Normal cadence is
+# 2 fps; 15 s tolerates a camera stall without freezing the watcher forever.
+FRAME_TIMEOUT = float(os.environ.get("FRAME_TIMEOUT", "15"))
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT", "")
 CLIPS = Path(os.environ.get("CLIPS_DIR", "/dev/shm/parcel-cam"))   # tmpfs = RAM, wiped on reboot
@@ -115,6 +118,13 @@ def stream_frames():
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
         while True:
+            # ponytail: read(n) blocks forever if ffmpeg stalls while the RTSP socket stays
+            # open — this camera does exactly that, and the whole watcher froze for 7 days with
+            # no exception and no log. A select timeout turns a stall into a clean restart.
+            if not select.select([proc.stdout], [], [], FRAME_TIMEOUT)[0]:
+                print("[signal] no frame for %.0fs, restarting stream" % FRAME_TIMEOUT,
+                      flush=True)
+                return
             buf = proc.stdout.read(n)
             if len(buf) < n:
                 return
